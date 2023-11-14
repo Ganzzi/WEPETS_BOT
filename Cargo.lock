@@ -7050,6 +7050,8 @@ dependencies = [
  "anyhow",
  "dotenvy",
  "futures",
+ "serde",
+ "serde_json",
  "serenity",
  "sui-json-rpc-types",
  "sui-sdk",

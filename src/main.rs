@@ -1,46 +1,99 @@
+mod commands;
+mod states;
+
 // region: IMPORTS
 use anyhow;
 use dotenvy::dotenv;
-use futures::{future, stream::StreamExt};
 use serenity::async_trait;
+use serenity::model::application::interaction::{Interaction, InteractionResponseType};
 use serenity::model::channel::Message;
 use serenity::model::gateway::Ready;
+use serenity::model::id::GuildId;
 use serenity::prelude::*;
+use states::GameState;
 use std::env;
 use std::str::FromStr;
-use sui_json_rpc_types::Coin;
-use sui_sdk::types::base_types::SuiAddress;
+use sui_sdk::types::base_types::{ObjectID, SuiAddress};
 use sui_sdk::{SuiClient, SuiClientBuilder};
 // endregion IMPORTS
 
 struct Handler {
     sui_client: SuiClient,
+    package_id: ObjectID,
+    address: SuiAddress,
 }
 
 #[async_trait]
 impl EventHandler for Handler {
     async fn message(&self, ctx: Context, msg: Message) {
-        if msg.content == "!balance" {
-            let address = SuiAddress::from_str(
-                "0xaaefb759f59e15131cfdb31628347b0567f21ee146c3656bc6af913b340ff6ad",
-            )
-            .unwrap_or_default();
-
-            let coin = fetch_coin(&self.sui_client, &address)
-                .await
-                .unwrap()
-                .unwrap();
-
-            let res = get_balance(address.to_string().as_str(), coin);
-
-            if let Err(why) = msg.channel_id.say(&ctx.http, res).await {
+        if msg.content == "hello" {
+            if let Err(why) = msg.channel_id.say(&ctx.http, "world").await {
                 println!("Error sending message: {:?}", why);
             }
         }
     }
 
-    async fn ready(&self, _: Context, ready: Ready) {
+    async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
+        if let Interaction::ApplicationCommand(command) = interaction {
+            println!("Received command interaction: {:#?}", command);
+            let res = GameState::new(&self.sui_client, self.address.clone())
+                .await
+                .get_game_state_board();
+
+            // TODO: add command -> function
+            match command.data.name.as_str() {
+                "hunt" => {
+                    let data = commands::hunt::do_hunt(
+                        &self.sui_client,
+                        &self.package_id,
+                        &command.data.options,
+                    )
+                    .await
+                    .map_err(|e| println!("!!error: {e:?}"))
+                    .unwrap();
+
+                    println!("{data:?}");
+                }
+                "battle" => {
+                    let _ =
+                        commands::battle::do_battle(&self.sui_client, &command.data.options).await;
+                }
+                _ => println!("not implemented :("),
+            };
+
+            if let Err(why) = command
+                .create_interaction_response(&ctx.http, |response| {
+                    response
+                        .kind(InteractionResponseType::ChannelMessageWithSource)
+                        .interaction_response_data(|message| message.content(res))
+                })
+                .await
+            {
+                println!("Cannot respond to slash command: {}", why);
+            }
+        }
+    }
+
+    async fn ready(&self, ctx: Context, ready: Ready) {
         println!("{} is connected!", ready.user.name);
+
+        let guild_id = GuildId(
+            env::var("GUILD_ID")
+                .expect("Expected GUILD_ID in environment")
+                .parse()
+                .expect("GUILD_ID must be an integer"),
+        );
+
+        let commands = GuildId::set_application_commands(&guild_id, &ctx.http, |commands| {
+            commands.create_application_command(|command| commands::hunt::register(command));
+            commands.create_application_command(|command| commands::battle::register(command))
+        })
+        .await;
+
+        println!(
+            "I now have the following guild slash commands: {:#?}",
+            commands
+        );
     }
 }
 
@@ -49,15 +102,25 @@ async fn main() -> Result<(), anyhow::Error> {
     dotenv().ok();
 
     let token = env::var("DISCORD_TOKEN").expect("Expected a token in the environment");
+
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::DIRECT_MESSAGES
         | GatewayIntents::MESSAGE_CONTENT;
 
-    let sui_client = Handler {
-        sui_client: SuiClientBuilder::default().build_localnet().await?,
+    let sui_client = SuiClientBuilder::default().build_localnet().await?;
+    let address = SuiAddress::from_str(env::var("SUI_CLIENT_ADDRESS").expect("").as_str())
+        .unwrap_or_default();
+
+    let handler = Handler {
+        sui_client,
+        package_id: ObjectID::from_str(
+            "0x229ce700bb2bbf4cfa17cb9d92d18c80885252b464258ecaa410c2d1b7f88512",
+        )?,
+        address,
     };
+
     let mut client = Client::builder(&token, intents)
-        .event_handler(sui_client)
+        .event_handler(handler)
         .await
         .expect("Err creating client");
 
@@ -68,35 +131,10 @@ async fn main() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-pub async fn fetch_coin(
-    sui: &SuiClient,
-    sender: &SuiAddress,
-) -> Result<Option<Coin>, anyhow::Error> {
-    let coin_type = "0x2::sui::SUI".to_string();
-    let coins_stream = sui
-        .coin_read_api()
-        .get_coins_stream(*sender, Some(coin_type));
-
-    let mut coins = coins_stream
-        .skip_while(|c| future::ready(c.balance < 5_000_000))
-        .boxed();
-    let coin = coins.next().await;
-    Ok(coin)
-}
-
-fn truncate_hex_string(input: &str, n: usize) -> String {
+pub fn truncate_hex_string(input: &str, n: usize) -> String {
     let prefix = &input[..n];
     let suffix = &input[input.len() - n..];
     let ellipsis = "..";
 
     format!("{}{}{}", prefix, ellipsis, suffix)
-}
-
-fn get_balance(address: &str, coin: Coin) -> String {
-    format!(
-        "----------------------------------------------\naddress: {:<30}\nbalance: {:<20}{:<10}",
-        truncate_hex_string(address, 15),
-        coin.balance,
-        coin.coin_type
-    )
 }
